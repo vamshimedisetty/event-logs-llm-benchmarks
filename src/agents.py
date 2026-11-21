@@ -43,14 +43,24 @@ class OntologyGraphEngine:
                 comp_name = target.replace("brand:", "")
                 competitors[comp_name] = competitors.get(comp_name, 0) + data["weight"]
 
-        ranked = sorted(competitors.items(), key=lambda x: x[1], reverse=True)[:5]
+        # ranked = sorted(competitors.items(), key=lambda x: x[1], reverse=True)[:5]
+        # return {
+        #     "source_brand": brand,
+        #     "category_filter": category or "all",
+        #     "top_switched_to_brands": [{"brand": b, "switch_sessions": w} for b, w in ranked],
+        #     "top_competitor": ranked[0][0] if ranked else None,
+        #     "top_competitor_switches": ranked[0][1] if ranked else 0,
+        # }
+
+        ranked = sorted(competitors.items(), key=lambda x: x, reverse=True)[:5]
         return {
             "source_brand": brand,
             "category_filter": category or "all",
             "top_switched_to_brands": [{"brand": b, "switch_sessions": w} for b, w in ranked],
-            "top_competitor": ranked[0][0] if ranked else None,
-            "top_competitor_switches": ranked[0][1] if ranked else 0,
+            "top_competitor": ranked if ranked else None,
+            "top_competitor_switches": ranked if ranked else 0,
         }
+
 
     def analyze_category_friction(self, category: str) -> Dict[str, Any]:
         """Traverses ABANDONED_BRAND_CART, BYPASSED_CART_DIRECT_BUY, and PURCHASED_BRAND links."""
