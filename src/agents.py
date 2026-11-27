@@ -1,16 +1,28 @@
+"""
+agents.py
+---------
+Implements our 4-Tier Progressive Data & Prompt Architecture Benchmark:
+  - Tier 1 (Raw Event Logs): Stateless Text-to-SQL directly over 42.45M `bronze_events` rows.
+  - Tier 2 (Semantic Layer): Text-to-SQL over stateful, bot-filtered `silver_sessions`.
+  - Tier 3 (Bare Ontology): Deterministic NetworkX graph traversal tools with zero prompt engineering.
+  - Tier 4 (Ontology + Prompt Eng + Golden Retrieval): Combines Tier 3 graph tools with explicit
+    domain axioms, dynamic TF-IDF golden query retrieval, and strict JSON extraction rules.
+"""
+
 import json
 import time
 from typing import Dict, Any, Optional
 import networkx as nx
 from openai import OpenAI
 from schemas import BenchmarkResponse
+from golden_queries import GoldenQueryRetriever
 
 
 # ==============================================================================
-# 1. Deterministic Ontology Graph Tools (Tier 3 Backend)
+# 1. Deterministic Ontology Graph Engine (Backend for Tiers 3 & 4)
 # ==============================================================================
 class OntologyGraphEngine:
-    """In-memory NetworkX graph built from workspace.default.ont_edges for fast causal traversal."""
+    """In-memory NetworkX MultiDiGraph built from `workspace.default.ont_edges`."""
 
     def __init__(self, spark):
         self.spark = spark
@@ -18,6 +30,7 @@ class OntologyGraphEngine:
         self._load_graph()
 
     def _load_graph(self):
+        """Loads typed object nodes and weighted relationship edges from Delta into NetworkX."""
         edges = self.spark.table("workspace.default.ont_edges").collect()
         for r in edges:
             self.graph.add_edge(
@@ -30,12 +43,12 @@ class OntologyGraphEngine:
             )
 
     def trace_brand_leakage(self, brand: str, category: Optional[str] = None) -> Dict[str, Any]:
-        """Multi-hop traversal: finds top competitor brands users switch TO from `brand`."""
+        """Traverses directed `SWITCHED_BRAND_TO` edges to rank top competitor brands."""
         src = f"brand:{brand.lower()}"
         if src not in self.graph:
             return {"error": f"Brand '{brand}' not found in ontology."}
 
-        competitors = {}
+        competitors: Dict[str, int] = {}
         for _, target, data in self.graph.out_edges(src, data=True):
             if data["relation_type"] == "SWITCHED_BRAND_TO":
                 if category and data["context_category"] != category.lower():
@@ -43,179 +56,113 @@ class OntologyGraphEngine:
                 comp_name = target.replace("brand:", "")
                 competitors[comp_name] = competitors.get(comp_name, 0) + data["weight"]
 
-        # ranked = sorted(competitors.items(), key=lambda x: x[1], reverse=True)[:5]
-        # return {
-        #     "source_brand": brand,
-        #     "category_filter": category or "all",
-        #     "top_switched_to_brands": [{"brand": b, "switch_sessions": w} for b, w in ranked],
-        #     "top_competitor": ranked[0][0] if ranked else None,
-        #     "top_competitor_switches": ranked[0][1] if ranked else 0,
-        # }
-
         ranked = sorted(competitors.items(), key=lambda x: x, reverse=True)[:5]
         return {
-            "source_brand": brand,
+            "source_brand": brand.lower(),
             "category_filter": category or "all",
             "top_switched_to_brands": [{"brand": b, "switch_sessions": w} for b, w in ranked],
             "top_competitor": ranked if ranked else None,
             "top_competitor_switches": ranked if ranked else 0,
         }
 
-
     def analyze_category_friction(self, category: str) -> Dict[str, Any]:
-        """Traverses ABANDONED_BRAND_CART, BYPASSED_CART_DIRECT_BUY, and PURCHASED_BRAND links."""
+        """Traverses `ABANDONED_BRAND_CART` edges from a category node to identify top friction brands."""
         src = f"category:{category.lower()}"
         if src not in self.graph:
             return {"error": f"Category '{category}' not found in ontology."}
 
-        summary = {"abandoned": 0, "direct_buy": 0, "standard_purchase": 0, "top_abandoned_brand": None}
-        max_abandon = -1
-
+        abandoned_by_brand: Dict[str, int] = {}
         for _, target, data in self.graph.out_edges(src, data=True):
-            rel = data["relation_type"]
-            w = data["weight"]
-            if rel == "ABANDONED_BRAND_CART":
-                summary["abandoned"] += w
-                if w > max_abandon:
-                    max_abandon = w
-                    summary["top_abandoned_brand"] = target.replace("brand:", "")
-            elif rel == "BYPASSED_CART_DIRECT_BUY":
-                summary["direct_buy"] += w
-            elif rel == "PURCHASED_BRAND":
-                summary["standard_purchase"] += w
+            if data["relation_type"] == "ABANDONED_BRAND_CART":
+                b_name = target.replace("brand:", "")
+                abandoned_by_brand[b_name] = abandoned_by_brand.get(b_name, 0) + data["weight"]
 
-        total_purchases = summary["direct_buy"] + summary["standard_purchase"]
-        summary["direct_buy_share_pct"] = round(
-            (summary["direct_buy"] / total_purchases * 100) if total_purchases > 0 else 0.0, 2
-        )
-        return summary
+        ranked = sorted(abandoned_by_brand.items(), key=lambda x: x, reverse=True)[:5]
+        return {
+            "category": category.lower(),
+            "top_abandoned_brand": ranked if ranked else None,
+            "top_abandoned_cart_count": ranked if ranked else 0,
+            "top_5_abandoned_brands": [{"brand": b, "abandoned_carts": w} for b, w in ranked],
+        }
+
+    def get_category_revenue_and_funnel(self, category: str) -> Dict[str, Any]:
+        """Aggregates purchase revenue and 1-click direct-buy share across category purchase edges."""
+        src = f"category:{category.lower()}"
+        if src not in self.graph:
+            return {"error": f"Category '{category}' not found in ontology."}
+
+        rev_total = 0.0
+        direct_cnt = 0
+        std_cnt = 0
+
+        for _, _, data in self.graph.out_edges(src, data=True):
+            rel = data["relation_type"]
+            if rel == "BYPASSED_CART_DIRECT_BUY":
+                direct_cnt += data["weight"]
+                rev_total += data["revenue_impact"]
+            elif rel == "PURCHASED_BRAND":
+                std_cnt += data["weight"]
+                rev_total += data["revenue_impact"]
+
+        total_buys = direct_cnt + std_cnt
+        return {
+            "category": category.lower(),
+            "total_purchase_revenue": round(rev_total, 2),
+            "direct_buy_sessions": direct_cnt,
+            "standard_purchase_sessions": std_cnt,
+            "direct_buy_share_pct": round((direct_cnt / total_buys * 100) if total_buys > 0 else 0.0, 2),
+        }
 
 
 # ==============================================================================
-# 2. Three-Tier Agent Orchestrator
+# 2. Four-Tier Agent Orchestrator
 # ==============================================================================
 class ThreeTierBenchmarkAgents:
-    """Executes the same diagnostic prompt across Tier 1 (Raw), Tier 2 (Semantic), and Tier 3 (Ontology)."""
+    """Runs identical diagnostic questions across Tiers 1, 2, 3, and 4 for controlled ablation."""
 
-    def __init__(self, spark, api_key: str, model: str = "gpt-4o-mini", base_url: Optional[str] = None):
+    def __init__(
+        self,
+        spark,
+        api_key: str,
+        model: str = "gemini-3.5-flash-lite",
+        base_url: Optional[str] = None,
+    ):
         self.spark = spark
         self.model = model
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.ontology = OntologyGraphEngine(spark)
+        self.retriever = GoldenQueryRetriever()
+
+    def _call_llm_with_retry(self, **kwargs):
+        """Wraps chat completions with exponential backoff on HTTP 429 rate-limit errors."""
+        for attempt in range(3):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    time.sleep(15 * (attempt + 1))
+                else:
+                    raise
 
     def _run_spark_sql(self, sql_query: str) -> str:
-        """Executes LLM-generated Spark SQL safely and returns compact JSON rows."""
-        clean_sql = sql_query.strip().removeprefix("```sql").removeprefix("```").removesuffix("```").strip()
-        rows = self.spark.sql(clean_sql).limit(10).collect()
-        return json.dumps([r.asDict() for r in rows], default=str)
-
-    def run_tier1_raw_logs(self, query_id: str, question: str) -> BenchmarkResponse:
-        """Tier 1 Baseline: LLM writes raw Spark SQL directly against 42.4M stateless bronze_events."""
-        t0 = time.perf_counter()
-        prompt = f"""You are a SQL analyst querying raw event logs in table `workspace.default.bronze_events`.
-Columns: event_ts (timestamp), event_type (string: view, cart, purchase), product_id (long), category_code (string, nullable), brand (string, nullable), price (double), user_id (long), user_session (string).
-Write a single valid Spark SQL query to answer: "{question}"
-Return ONLY raw SQL without markdown formatting."""
-
+        """Executes LLM-generated Spark SQL with a 45-second timeout guardrail against runaway self-joins."""
+        clean_sql = (
+            sql_query.strip()
+            .removeprefix("```sql")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        self.spark.sql("SET STATEMENT_TIMEOUT = 45")
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model, temperature=0.0, messages=[{"role": "user", "content": prompt}]
-            )
-            sql_code = resp.choices[0].message.content
-            in_tok, out_tok = resp.usage.prompt_tokens, resp.usage.completion_tokens
+            rows = self.spark.sql(clean_sql).limit(10).collect()
+            return json.dumps([r.asDict() for r in rows], default=str)
+        finally:
+            self.spark.sql("SET STATEMENT_TIMEOUT = 0")
 
-            sql_result = self._run_spark_sql(sql_code)
-
-            extract_prompt = f"""Question: {question}
-SQL Output: {sql_result}
-Extract the final answer strictly as JSON with keys: "numeric_answer" (float or null), "entity_answer" (string or null), "root_cause_explanation" (string)."""
-            resp2 = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": extract_prompt}],
-            )
-            parsed = json.loads(resp2.choices[0].message.content)
-            in_tok += resp2.usage.prompt_tokens
-            out_tok += resp2.usage.completion_tokens
-
-            return BenchmarkResponse(
-                tier="Tier1_RawLogs",
-                query_id=query_id,
-                numeric_answer=parsed.get("numeric_answer"),
-                entity_answer=parsed.get("entity_answer"),
-                root_cause_explanation=parsed.get("root_cause_explanation", ""),
-                generated_code_or_tool=sql_code,
-                prompt_tokens=in_tok,
-                completion_tokens=out_tok,
-                latency_sec=round(time.perf_counter() - t0, 3),
-            )
-        except Exception as e:
-            return BenchmarkResponse(
-                tier="Tier1_RawLogs",
-                query_id=query_id,
-                root_cause_explanation="Execution failed",
-                generated_code_or_tool="ERROR",
-                latency_sec=round(time.perf_counter() - t0, 3),
-                execution_error=str(e)[:300],
-            )
-
-    def run_tier2_semantic_layer(self, query_id: str, question: str) -> BenchmarkResponse:
-        """Tier 2 Challenger: LLM queries modeled, bot-filtered stateful `silver_sessions`."""
-        t0 = time.perf_counter()
-        prompt = f"""You are a SQL analyst querying modeled session data in `workspace.default.silver_sessions`.
-Columns: clean_session_id, user_id, duration_sec, total_events, view_count, cart_count, purchase_count, brand_switch_count, price_step_down_count, primary_category, primary_brand, final_brand, avg_price_viewed, session_revenue, is_bot_suspect (boolean), funnel_outcome (direct_purchase_no_cart, standard_purchase, cart_abandoned, single_event_bounce, multi_view_browse).
-Always filter `WHERE is_bot_suspect = false`.
-Write a single valid Spark SQL query to answer: "{question}"
-Return ONLY raw SQL without markdown."""
-
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model, temperature=0.0, messages=[{"role": "user", "content": prompt}]
-            )
-            sql_code = resp.choices[0].message.content
-            in_tok, out_tok = resp.usage.prompt_tokens, resp.usage.completion_tokens
-
-            sql_result = self._run_spark_sql(sql_code)
-
-            extract_prompt = f"""Question: {question}
-SQL Output: {sql_result}
-Extract the final answer strictly as JSON with keys: "numeric_answer" (float or null), "entity_answer" (string or null), "root_cause_explanation" (string)."""
-            resp2 = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": extract_prompt}],
-            )
-            parsed = json.loads(resp2.choices[0].message.content)
-            in_tok += resp2.usage.prompt_tokens
-            out_tok += resp2.usage.completion_tokens
-
-            return BenchmarkResponse(
-                tier="Tier2_SemanticLayer",
-                query_id=query_id,
-                numeric_answer=parsed.get("numeric_answer"),
-                entity_answer=parsed.get("entity_answer"),
-                root_cause_explanation=parsed.get("root_cause_explanation", ""),
-                generated_code_or_tool=sql_code,
-                prompt_tokens=in_tok,
-                completion_tokens=out_tok,
-                latency_sec=round(time.perf_counter() - t0, 3),
-            )
-        except Exception as e:
-            return BenchmarkResponse(
-                tier="Tier2_SemanticLayer",
-                query_id=query_id,
-                root_cause_explanation="Execution failed",
-                generated_code_or_tool="ERROR",
-                latency_sec=round(time.perf_counter() - t0, 3),
-                execution_error=str(e)[:300],
-            )
-
-    def run_tier3_ontology(self, query_id: str, question: str) -> BenchmarkResponse:
-        """Tier 3 Ontology Agent: Uses deterministic Python graph traversal tools over typed objects & links."""
-        t0 = time.perf_counter()
-        tools = [
+    def _ontology_tools_schema(self):
+        """OpenAI-compatible function calling definitions shared identically by Tier 3 and Tier 4."""
+        return [
             {
                 "type": "function",
                 "function": {
@@ -225,7 +172,7 @@ Extract the final answer strictly as JSON with keys: "numeric_answer" (float or 
                         "type": "object",
                         "properties": {
                             "brand": {"type": "string"},
-                            "category": {"type": "string", "description": "Optional top-level category filter"},
+                            "category": {"type": "string"},
                         },
                         "required": ["brand"],
                     },
@@ -235,7 +182,19 @@ Extract the final answer strictly as JSON with keys: "numeric_answer" (float or 
                 "type": "function",
                 "function": {
                     "name": "analyze_category_friction",
-                    "description": "Traverses category-to-brand edges for cart abandonment, 1-click direct purchases, and standard checkouts.",
+                    "description": "Finds top abandoned brand and cart friction counts in a category.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"category": {"type": "string"}},
+                        "required": ["category"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_category_revenue_and_funnel",
+                    "description": "Returns purchase revenue and direct-buy funnel share % for a category.",
                     "parameters": {
                         "type": "object",
                         "properties": {"category": {"type": "string"}},
@@ -245,61 +204,21 @@ Extract the final answer strictly as JSON with keys: "numeric_answer" (float or 
             },
         ]
 
+    def _execute_ontology_tool(self, fn_name: str, fn_args: dict) -> dict:
+        """Dispatches tool calls to the deterministic NetworkX OntologyGraphEngine."""
+        if fn_name == "trace_brand_leakage":
+            return self.ontology.trace_brand_leakage(**fn_args)
+        elif fn_name == "analyze_category_friction":
+            return self.ontology.analyze_category_friction(**fn_args)
+        return self.ontology.get_category_revenue_and_funnel(**fn_args)
+
+    # --------------------------------------------------------------------------
+    # TIER 1: Raw Bronze Event Logs (Stateless Text-to-SQL Baseline)
+    # --------------------------------------------------------------------------
+    def run_tier1_raw_logs(self, query_id: str, question: str) -> BenchmarkResponse:
+        t0 = time.perf_counter()
+        prompt = f"""You are a SQL analyst querying raw event logs in `workspace.default.bronze_events`.
+Columns: event_ts, event_type (view, cart, purchase), product_id, category_code, brand, price, user_id, user_session.
+Write a single valid Spark SQL query to answer: "{question}"
+Return ONLY raw SQL without markdown."""
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                tools=tools,
-                tool_choice="auto",
-                messages=[{"role": "user", "content": question}],
-            )
-            in_tok, out_tok = resp.usage.prompt_tokens, resp.usage.completion_tokens
-            msg = resp.choices[0].message
-
-            if msg.tool_calls:
-                tc = msg.tool_calls[0]
-                fn_name = tc.function.name
-                fn_args = json.loads(tc.function.arguments)
-                if fn_name == "trace_brand_leakage":
-                    tool_out = self.ontology.trace_brand_leakage(**fn_args)
-                else:
-                    tool_out = self.ontology.analyze_category_friction(**fn_args)
-                tool_trace = f"{fn_name}({fn_args})"
-            else:
-                tool_out = {"note": "Fallback to semantic layer"}
-                tool_trace = "no_tool_invoked"
-
-            synth_prompt = f"""Question: {question}
-Ontology Graph Traversal Result: {json.dumps(tool_out)}
-Extract the final answer strictly as JSON with keys: "numeric_answer" (float or null), "entity_answer" (string or null), "root_cause_explanation" (string)."""
-
-            resp2 = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": synth_prompt}],
-            )
-            parsed = json.loads(resp2.choices[0].message.content)
-            in_tok += resp2.usage.prompt_tokens
-            out_tok += resp2.usage.completion_tokens
-
-            return BenchmarkResponse(
-                tier="Tier3_Ontology",
-                query_id=query_id,
-                numeric_answer=parsed.get("numeric_answer"),
-                entity_answer=parsed.get("entity_answer"),
-                root_cause_explanation=parsed.get("root_cause_explanation", ""),
-                generated_code_or_tool=tool_trace,
-                prompt_tokens=in_tok,
-                completion_tokens=out_tok,
-                latency_sec=round(time.perf_counter() - t0, 3),
-            )
-        except Exception as e:
-            return BenchmarkResponse(
-                tier="Tier3_Ontology",
-                query_id=query_id,
-                root_cause_explanation="Execution failed",
-                generated_code_or_tool="ERROR",
-                latency_sec=round(time.perf_counter() - t0, 3),
-                execution_error=str(e)[:300],
-            )
