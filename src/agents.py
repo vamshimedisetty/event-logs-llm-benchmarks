@@ -125,32 +125,58 @@ class ThreeTierBenchmarkAgents:
         self.ontology = OntologyGraphEngine(spark)
         self.retriever = GoldenQueryRetriever()
 
-    def _call_llm_with_retry(self, **kwargs):
-        """Retries up to 3 times on HTTP 429 rate-limit errors with exponential backoff."""
-        for attempt in range(3):
-            try:
-                return self.client.chat.completions.create(**kwargs)
-            except Exception as e:
-                if "429" in str(e) and attempt < 2:
-                    time.sleep(15 * (attempt + 1))
-                else:
-                    raise
+    # def _call_llm_with_retry(self, **kwargs):
+    #     """Retries up to 3 times on HTTP 429 rate-limit errors with exponential backoff."""
+    #     for attempt in range(3):
+    #         try:
+    #             return self.client.chat.completions.create(**kwargs)
+    #         except Exception as e:
+    #             if "429" in str(e) and attempt < 2:
+    #                 time.sleep(15 * (attempt + 1))
+    #             else:
+    #                 raise
 
+    def _call_llm_with_retry(self, **kwargs):
+     """Retries up to 4 times on HTTP 429 rate-limit or 503 overload errors."""
+     for attempt in range(4):
+         try:
+             return self.client.chat.completions.create(**kwargs)
+         except Exception as e:
+             err = str(e)
+             if ("429" in err or "503" in err) and attempt < 3:
+                 time.sleep(25 * (attempt + 1))
+             else:
+                 raise
+
+
+    # def _run_spark_sql(self, sql_query: str) -> str:
+    #     """Executes LLM-generated Spark SQL with a 45-second timeout guardrail."""
+    #     clean_sql = (
+    #         sql_query.strip()
+    #         .removeprefix("```sql")
+    #         .removeprefix("```")
+    #         .removesuffix("```")
+    #         .strip()
+    #     )
+    #     self.spark.sql("SET STATEMENT_TIMEOUT = 45")
+    #     try:
+    #         rows = self.spark.sql(clean_sql).limit(10).collect()
+    #         return json.dumps([r.asDict() for r in rows], default=str)
+    #     finally:
+    #         self.spark.sql("SET STATEMENT_TIMEOUT = 0")
+    
     def _run_spark_sql(self, sql_query: str) -> str:
-        """Executes LLM-generated Spark SQL with a 45-second timeout guardrail."""
-        clean_sql = (
-            sql_query.strip()
-            .removeprefix("```sql")
-            .removeprefix("```")
-            .removesuffix("```")
-            .strip()
-        )
-        self.spark.sql("SET STATEMENT_TIMEOUT = 45")
-        try:
-            rows = self.spark.sql(clean_sql).limit(10).collect()
-            return json.dumps([r.asDict() for r in rows], default=str)
-        finally:
-            self.spark.sql("SET STATEMENT_TIMEOUT = 0")
+     """Executes LLM-generated Spark SQL and returns compact JSON rows."""
+     clean_sql = (
+         sql_query.strip()
+         .removeprefix("```sql")
+         .removeprefix("```")
+         .removesuffix("```")
+         .strip()
+     )
+     rows = self.spark.sql(clean_sql).limit(10).collect()
+     return json.dumps([r.asDict() for r in rows], default=str)
+
 
     def _ontology_tools_schema(self):
         """Function-calling schemas shared identically by Tier 3 and Tier 4."""
