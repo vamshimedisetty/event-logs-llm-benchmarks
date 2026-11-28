@@ -230,6 +230,60 @@ class ThreeTierBenchmarkAgents:
             return self.ontology.analyze_category_friction(**fn_args)
         return self.ontology.get_category_revenue_and_funnel(**fn_args)
 
+    # def run_tier1_raw_logs(self, query_id: str, question: str) -> BenchmarkResponse:
+    #     """Tier 1 Baseline: Stateless Text-to-SQL over 42.45M bronze_events rows."""
+    #     t0 = time.perf_counter()
+    #     prompt = (
+    #         "You are a SQL analyst querying raw event logs in `workspace.default.bronze_events`.\n"
+    #         "Columns: event_ts, event_type (view, cart, purchase), product_id, category_code, brand, price, user_id, user_session.\n"
+    #         f'Write a single valid Spark SQL query to answer: "{question}"\n'
+    #         "Return ONLY raw SQL without markdown."
+    #     )
+    #     try:
+    #         resp = self._call_llm_with_retry(
+    #             model=self.model, temperature=0.0, messages=[{"role": "user", "content": prompt}]
+    #         )
+    #         sql_code = resp.choices.message.content
+    #         in_tok, out_tok = resp.usage.prompt_tokens, resp.usage.completion_tokens
+    #         sql_result = self._run_spark_sql(sql_code)
+
+    #         extract_prompt = (
+    #             f"Question: {question}\n"
+    #             f"SQL Output: {sql_result}\n"
+    #             'Extract the final answer strictly as JSON with keys: "numeric_answer" (float or null), '
+    #             '"entity_answer" (string or null), "root_cause_explanation" (string).'
+    #         )
+    #         resp2 = self._call_llm_with_retry(
+    #             model=self.model,
+    #             temperature=0.0,
+    #             response_format={"type": "json_object"},
+    #             messages=[{"role": "user", "content": extract_prompt}],
+    #         )
+    #         parsed = json.loads(resp2.choices.message.content)
+    #         in_tok += resp2.usage.prompt_tokens
+    #         out_tok += resp2.usage.completion_tokens
+
+    #         return BenchmarkResponse(
+    #             tier="Tier1_RawLogs",
+    #             query_id=query_id,
+    #             numeric_answer=parsed.get("numeric_answer"),
+    #             entity_answer=parsed.get("entity_answer"),
+    #             root_cause_explanation=parsed.get("root_cause_explanation", ""),
+    #             generated_code_or_tool=sql_code,
+    #             prompt_tokens=in_tok,
+    #             completion_tokens=out_tok,
+    #             latency_sec=round(time.perf_counter() - t0, 3),
+    #         )
+    #     except Exception as e:
+    #         return BenchmarkResponse(
+    #             tier="Tier1_RawLogs",
+    #             query_id=query_id,
+    #             root_cause_explanation="Execution failed",
+    #             generated_code_or_tool="ERROR",
+    #             latency_sec=round(time.perf_counter() - t0, 3),
+    #             execution_error=str(e)[:300],
+    #         )
+
     def run_tier1_raw_logs(self, query_id: str, question: str) -> BenchmarkResponse:
         """Tier 1 Baseline: Stateless Text-to-SQL over 42.45M bronze_events rows."""
         t0 = time.perf_counter()
@@ -243,7 +297,7 @@ class ThreeTierBenchmarkAgents:
             resp = self._call_llm_with_retry(
                 model=self.model, temperature=0.0, messages=[{"role": "user", "content": prompt}]
             )
-            sql_code = resp.choices.message.content
+            sql_code = resp.choices[0].message.content
             in_tok, out_tok = resp.usage.prompt_tokens, resp.usage.completion_tokens
             sql_result = self._run_spark_sql(sql_code)
 
@@ -259,7 +313,7 @@ class ThreeTierBenchmarkAgents:
                 response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": extract_prompt}],
             )
-            parsed = json.loads(resp2.choices.message.content)
+            parsed = json.loads(resp2.choices[0].message.content)
             in_tok += resp2.usage.prompt_tokens
             out_tok += resp2.usage.completion_tokens
 
@@ -283,6 +337,7 @@ class ThreeTierBenchmarkAgents:
                 latency_sec=round(time.perf_counter() - t0, 3),
                 execution_error=str(e)[:300],
             )
+
 
     def run_tier2_semantic_layer(self, query_id: str, question: str) -> BenchmarkResponse:
         """Tier 2 Semantic Layer: Text-to-SQL over stateful, bot-filtered silver_sessions."""
